@@ -399,7 +399,6 @@ sources:
       assert.strictEqual(actionConfig.working_dir, '~/default/path');
     });
 
-<<<<<<< HEAD
     test('builds action config for repo-agnostic Jira source', async () => {
       const config = `
 sources:
@@ -434,7 +433,8 @@ sources:
       assert.strictEqual(actionConfig.working_dir, '~/projects/jira-work');
       // repo_path is set from working_dir (normalized by buildActionConfigFromSource)
       assert.strictEqual(actionConfig.repo_path, '~/projects/jira-work');
-=======
+    });
+
     test('repo model overrides defaults model', async () => {
       const config = `
 defaults:
@@ -535,7 +535,6 @@ sources:
       // Should fall back to defaults.model
       assert.strictEqual(actionConfig.model, 'anthropic/claude-haiku-3.5',
         'defaults model should be used when neither source nor repo sets model');
->>>>>>> main
     });
   });
 });
