@@ -36,6 +36,62 @@ import os from "os";
 export const HEADER_TIMEOUT_MS = 180_000;
 
 /**
+ * Read model configuration from a target directory's OpenCode config file.
+ *
+ * Looks for `.opencode/opencode.json` (or `.jsonc`) in `dir`. If an `agentName`
+ * is provided, the per-agent model (`.agent.<name>.model`) takes precedence
+ * over the global `.model` value. Returns `{}` when no file is found or the
+ * file cannot be parsed.
+ *
+ * @param {string} dir - Absolute path to the target project directory
+ * @param {string} [agentName] - Optional agent name for per-agent model lookup
+ * @returns {{ model?: string }} Extracted config fields
+ */
+export function readTargetOpencodeConfig(dir, agentName) {
+  const candidates = [
+    path.join(dir, '.opencode', 'opencode.json'),
+    path.join(dir, '.opencode', 'opencode.jsonc'),
+  ];
+
+  let raw;
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      try {
+        raw = readFileSync(candidate, 'utf-8');
+      } catch {
+        return {};
+      }
+      break;
+    }
+  }
+
+  if (!raw) return {};
+
+  let parsed;
+  try {
+    // Strip single-line comments for .jsonc support before parsing
+    const stripped = raw.replace(/\/\/[^\n]*/g, '');
+    parsed = JSON.parse(stripped);
+  } catch {
+    return {};
+  }
+
+  const result = {};
+
+  // Per-agent model takes priority over global model
+  const agentModel = agentName && parsed.agent?.[agentName]?.model;
+  const globalModel = parsed.model;
+
+  if (agentModel) {
+    result.model = agentModel;
+  } else if (globalModel) {
+    result.model = globalModel;
+  }
+
+  return result;
+}
+
+/**
  * Parse a slash command from the beginning of a prompt
  * Returns null if the prompt doesn't start with a slash command
  * 
@@ -363,13 +419,34 @@ export function buildPromptFromTemplate(templateName, item, templatesDir) {
 
 /**
  * Merge source, repo config, and defaults into action config
- * Priority: source > repo > defaults
- * @param {object} source - Source configuration
+ * Priority: explicit source > repo > defaults
+ * @param {object} source - Source configuration (may include _explicit tracking from normalizeSource)
  * @param {object} repoConfig - Repository configuration
  * @param {object} defaults - Default configuration
+ * @param {object} [targetDirConfig] - Optional model config read from the target dir's opencode config.
+ *   Used as a low-priority fallback: only applied when no model is set by source, repo, or defaults.
  * @returns {object} Merged action config
  */
-export function getActionConfig(source, repoConfig, defaults) {
+export function getActionConfig(source, repoConfig, defaults, targetDirConfig = {}) {
+  // _explicit tracks fields set directly on the source (not inherited from defaults).
+  // When _explicit is absent (e.g., tests constructing source objects directly), fall
+  // back to treating non-undefined source fields as explicit.
+  const explicit = source._explicit;
+
+  const resolveField = (field) => {
+    if (explicit) {
+      if (explicit[field] !== undefined) return explicit[field];
+      if (repoConfig[field] !== undefined) return repoConfig[field];
+      if (defaults[field] !== undefined) return defaults[field];
+      return targetDirConfig[field];
+    }
+    // No tracking: source wins, then repo, then defaults, then target dir
+    if (source[field] !== undefined) return source[field];
+    if (repoConfig[field] !== undefined) return repoConfig[field];
+    if (defaults[field] !== undefined) return defaults[field];
+    return targetDirConfig[field];
+  };
+
   return {
     // Defaults first
     ...defaults,
@@ -380,11 +457,11 @@ export function getActionConfig(source, repoConfig, defaults) {
       ...(defaults.session || {}),
       ...(repoConfig.session || {}),
     },
-    // Source-level overrides (highest priority)
-    ...(source.prompt && { prompt: source.prompt }),
-    ...(source.agent && { agent: source.agent }),
-    ...(source.model && { model: source.model }),
-    ...(source.working_dir && { working_dir: source.working_dir }),
+    // Operational fields with correct priority: explicit source > repo > defaults
+    ...(resolveField('prompt') && { prompt: resolveField('prompt') }),
+    ...(resolveField('agent') && { agent: resolveField('agent') }),
+    ...(resolveField('model') && { model: resolveField('model') }),
+    ...(resolveField('working_dir') && { working_dir: resolveField('working_dir') }),
   };
 }
 
@@ -960,6 +1037,8 @@ async function executeInDirectory(serverUrl, sessionCtx, item, config, options =
       command: apiCommand,
       directory: cwd,
       dryRun: true,
+      ...(config.model && { model: config.model }),
+      ...(config.agent && { agent: config.agent }),
     };
   }
   
@@ -1005,6 +1084,17 @@ export async function executeAction(item, config, options = {}) {
   }
   
   const baseCwd = expandPath(workingDir);
+
+  // Apply target directory's opencode config as a low-priority fallback for model.
+  // This reads <baseCwd>/.opencode/opencode.json and uses its model settings only
+  // when no model is specified in the pilot config (source > repo > defaults).
+  if (!config.model) {
+    const targetDirConfig = readTargetOpencodeConfig(baseCwd, config.agent);
+    if (targetDirConfig.model) {
+      debug(`executeAction: using target dir model=${targetDirConfig.model} from ${baseCwd}/.opencode/opencode.json`);
+      config = { ...config, model: targetDirConfig.model };
+    }
+  }
   
   // Discover running opencode server for this directory
   const discoverFn = options.discoverServer || discoverOpencodeServer;
